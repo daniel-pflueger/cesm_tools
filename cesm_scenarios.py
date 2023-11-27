@@ -9,19 +9,68 @@ import numpy as np
 import matplotlib.pyplot as plt
 # Local scripts
 import geo_tools
+import pop_plot
+import cesm_data_tools
 
 #
 # Field types
 #
 
+'''
 class Equidistant_Lon_Lat_Field(xr.DataArray):
     
-    '''
+    \'''
     DataArrays that are defined on a two-dimensional equidistant longitude ('lon') and latitude ('lat') grid with optional time dimension.
-    '''
+    \'''
     
     def global_mean(self):
         return geo_tools.global_mean(self)
+    
+    def regional_mean(self,mask):
+        return geo_tools.global_mean(self,mask=mask)
+'''
+file_dir_path = os.path.dirname(os.path.realpath(__file__))
+EQUIDISTANT_GRID_AREA_PATH = os.path.join(file_dir_path,'./grids/cam6_area.nc')
+
+@xr.register_dataarray_accessor("geo")
+class EquidistantField():
+    
+    '''
+    xarray-DataArray extension for data defined on an equidistant longitude-latitude grid.
+    '''
+    
+    # Load global grid area mask
+    # Expecting units of m^2
+    global_mask = xr.open_dataset(EQUIDISTANT_GRID_AREA_PATH).AREA.isel(time=0)
+    
+    def __init__(self,da):
+        self._da = da
+            
+    def sfc_integral(self,mask=global_mask):
+        return (self._da * mask).sum(dim=['lat','lon'])
+        
+    def sfc_mean(self,mask=global_mask):
+        '''
+        Compute mean of a field over Earth surface.
+        '''
+        integral = self.sfc_integral(mask)
+        norm = mask.geo.sfc_integral(mask=xr.ones_like(mask)) # Compute area of mask
+        return integral/norm
+    
+
+@xr.register_dataarray_accessor("ocn")
+class POP2Field():
+    
+    '''
+    xarray-DataArray extension for data defined on an ocn ocean grid
+    '''
+    
+    def __init__(self,da):
+        # create dataset with cyclic points
+        self._ds_plot = pop_plot.pop_add_cyclic(da.to_dataset().compute())
+            
+    def plot_na(self,pc_params={},fig_params={}):
+        return cesm_data_tools.plot_pop_na_conic(self._ds_plot,pc_params=pc_params,fig_params=fig_params)
 
 #
 # Main class 
@@ -48,7 +97,7 @@ class Scenario:
         # Initialize an empty dictionary that is later used to store xarray Datasets
         self.var = {}
 
-    def __get_attr__(self,var):
+    def __getitem__(self,var):
         return self.var[var]
 
     #
@@ -89,7 +138,10 @@ class Scenario:
         
         return fetched
     
-    def _get_monthly_var(self,var,component):
+    def _get_monthly_var(self,
+                         var,
+                         component,
+                         chunk_size=12):
         '''
         Load monthly output variable from a specific component, e.g. 'ocn'
         
@@ -97,6 +149,7 @@ class Scenario:
         ---
         var (string): name of variable
         component (string): generic component name 'ocn', 'atm' etc.
+        chunk_size (int): number of time steps per dask chunk
         '''
         # components: their names (e.g. 'cam') and the tag for the monthly output stream (e.g. 'h0')
         comp_names = {'ocn': {'name': 'pop', 'stream': 'h'},
@@ -128,7 +181,7 @@ class Scenario:
             # iterate over these files
             da_case_container = []
             for file_path in files_case:
-                da_case_container.append(xr.open_dataset(file_path,chunks={'time': 12})[var]) 
+                da_case_container.append(xr.open_dataset(file_path,chunks={'time': chunk_size})[var]) 
             
             # Concatenate and select years
             # This selection is done because a case can in principle have faulty data in some years
@@ -142,36 +195,59 @@ class Scenario:
         self.var[var] = da
         return da
         
-    def get_atm_var(self,var):
+    def get_atm_var(self,var,**kwargs):
         '''
         Get monthly atmospheric component variable
         '''
-        self._get_monthly_var(var,'atm')
+        self._get_monthly_var(var,'atm',**kwargs)
 
-    def get_ocn_var(self,var):
+    def get_ocn_var(self,var,**kwargs):
         '''
         Get monthly ocean component variable
         '''
-        self._get_monthly_var(var,'ocn')
+        self._get_monthly_var(var,'ocn',**kwargs)
         
-    def get_ice_var(self,var):
+    def get_ice_var(self,var,**kwargs):
         '''
         Get monthly ice component variable
         '''
-        self._get_monthly_var(var,'ice')
+        self._get_monthly_var(var,'ice',**kwargs)
             
     # Hassle-free computation of derived variables:
     # use stored time series of CESM output to compute variables of interest, 
     # e.g. freshwater import/export due to overturning at southern Atlantic boundary or global mean surface temperature
     
-    def compute_T0(self):
+    def sea_ice_extent(self,threshold=0.15):
         '''
-        Compute the global mean surface temperature
+        Compute northern and southern hemisphere sea-ice fraction using geo_tools.sea_ice_extent. Units are km^2
+        
+        Parameters:
+        ---
+        threshold (float): Value between 0 and 1 determining the threshold of ice fraction above which a grid cell's surface area is counted.
+        
+        Returns:
+        ---
+        Tuple: Global, NH and SH sea ice extent (0th, 1st and 2nd element of tuple respectively)
         '''
-        self._check_var('TREFHT','atm')
-       
-        self.var['T0'] = geo_tools.global_mean(self.var['TREFHT'])
-        return self.var['T0']
+        self.get_atm_var('ICEFRAC')
+        
+        for mode in ['global','nh','sh']:
+            # Note that the global sea ice extent could be calculated as the sum of SH and SH extent
+            # thereby saving some computation time.
+            # This approach is a bit more legible though.
+            self.var[f'{mode}_sea_ice_extent'] = geo_tools.sea_ice_extent(self.var['ICEFRAC'],mode=mode,threshold=threshold)
+
+        return (self.var['global_sea_ice_extent'],
+                self.var['nh_sea_ice_extent'],
+                self.var['sh_sea_ice_extent'])
+    
+    def gmst(self):
+        '''
+        Compute the global mean surface temperature (GMST) from the temperature at reference height (2m) above the surface 'TREFHT'
+        '''
+        self.get_atm_var('TREFHT')
+        self.var['gmst'] = geo_tools.global_mean(self.var['TREFHT'])
+        return self.var['gmst']
     
     def M_ov(self,S_0=34.5):
         
